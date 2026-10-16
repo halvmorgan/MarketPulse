@@ -1,0 +1,6 @@
+{
+  "name": "Market Pulse",
+  "description": "A research dashboard that reads the market on any topic with three live reads: What People Ask, What's Working on Social, and Rising in Your State.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
