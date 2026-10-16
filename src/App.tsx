@@ -237,6 +237,141 @@ export default function App() {
     }
   };
 
+  // Execute ALL sections in a single grounded Gemini call (cost optimization —
+  // avoids paying for 3 separate Google Search grounding requests when a fresh
+  // run needs more than one section).
+  const runCombinedFetch = async (
+    targetTopic: string,
+    targetLocation: string,
+    isNationalTarget: boolean,
+    keysToFetch: SectionKey[]
+  ) => {
+    const fetchStart = performance.now();
+
+    try {
+      const response = await fetch('/api/market-pulse/read', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          topic: targetTopic,
+          location: targetLocation,
+          section: 'all',
+        }),
+      });
+
+      const json = await response.json();
+
+      if (!response.ok) {
+        throw new Error(json.error || `Server responded with ${response.status}`);
+      }
+
+      const durationSec = Math.max(1, Math.round((performance.now() - fetchStart) / 1000));
+      keysToFetch.forEach((secKey) => saveSectionDuration(secKey, durationSec));
+
+      // Mark every fetched section done together (one shared call, so there's
+      // no per-section timing/retry signal to show individually).
+      setSections((prev) => {
+        const updated = { ...prev };
+        keysToFetch.forEach((secKey) => {
+          updated[secKey] = { ...updated[secKey], status: 'done', durationSec };
+        });
+        return updated;
+      });
+
+      // Still cache each section individually so single-section retry and
+      // partial-cache logic elsewhere keep working unchanged.
+      keysToFetch.forEach((secKey) => {
+        try {
+          const secData =
+            secKey === 'people_ask'
+              ? json.people_ask
+              : secKey === 'social'
+              ? json.social
+              : isNationalTarget
+              ? json.national_pulse
+              : json.state_pulse;
+
+          const secCacheKey = getSectionStorageKey(targetTopic, targetLocation, secKey);
+          localStorage.setItem(
+            secCacheKey,
+            JSON.stringify({
+              data: secData,
+              grounding_sources: json.grounding_sources || [],
+              search_queries_used: json.search_queries_used || [],
+              durationSec,
+              formatted_time: json.formatted_time || formatCurrentTimestamp(),
+            })
+          );
+        } catch {
+          // ignore
+        }
+      });
+
+      // Fill pulseData with every section from this one response at once.
+      setPulseData((prev) => {
+        const base: MarketPulseResult = prev || {
+          topic: targetTopic,
+          location: targetLocation,
+          is_national: isNationalTarget,
+          generated_at: new Date().toISOString(),
+          formatted_time: json.formatted_time || formatCurrentTimestamp(),
+          people_ask: undefined as any,
+          social: undefined as any,
+          state_pulse: undefined,
+          national_pulse: undefined,
+          grounding_sources: [],
+          search_queries_used: [],
+        };
+
+        const updated: MarketPulseResult = { ...base, formatted_time: json.formatted_time || base.formatted_time };
+
+        if (keysToFetch.includes('people_ask')) {
+          updated.people_ask = json.people_ask;
+        }
+        if (keysToFetch.includes('social')) {
+          updated.social = json.social;
+        }
+        if (keysToFetch.includes('rising')) {
+          if (isNationalTarget) {
+            updated.national_pulse = json.national_pulse;
+            updated.state_pulse = undefined;
+          } else {
+            updated.state_pulse = json.state_pulse;
+            updated.national_pulse = undefined;
+          }
+        }
+
+        if (json.grounding_sources && Array.isArray(json.grounding_sources)) {
+          const currentUrls = new Set(updated.grounding_sources.map((s) => s.uri));
+          const newSources = json.grounding_sources.filter((s: any) => !currentUrls.has(s.uri));
+          updated.grounding_sources = [...updated.grounding_sources, ...newSources];
+        }
+
+        if (json.search_queries_used && Array.isArray(json.search_queries_used)) {
+          const currentQ = new Set(updated.search_queries_used);
+          const newQ = json.search_queries_used.filter((q: string) => !currentQ.has(q));
+          updated.search_queries_used = [...updated.search_queries_used, ...newQ];
+        }
+
+        return updated;
+      });
+
+      return { success: true, durationSec };
+    } catch (err: any) {
+      console.error('Error in combined fetch:', err);
+
+      setSections((prev) => {
+        const updated = { ...prev };
+        keysToFetch.forEach((secKey) => {
+          updated[secKey] = { ...updated[secKey], status: 'error', errorMessage: err.message || "Couldn't finish" };
+        });
+        return updated;
+      });
+
+      return { success: false, error: err };
+    }
+  };
+
   // Main readMarket controller with time estimates and caching
   const readMarket = async (searchTopic: string, searchLocation: string, forceRefresh = false) => {
     const cleanTopic = searchTopic.trim();
@@ -361,18 +496,27 @@ export default function App() {
       setElapsedSec(elapsed);
     }, 5000);
 
-    // Launch parallel fetches for uncached sections
-    const tasks: Promise<any>[] = [];
+    // Fetch uncached sections. When more than one section needs fetching, use
+    // a single combined Gemini call instead of one grounded call per section —
+    // grounded Google Search requests are billed per call, so 3 separate calls
+    // cost roughly 3x a single combined call for the same data.
     const keysToFetch: SectionKey[] = [];
 
     (Object.keys(newSectionStates) as SectionKey[]).forEach((key) => {
       if (newSectionStates[key].status === 'working') {
         keysToFetch.push(key);
-        tasks.push(runSectionFetch(cleanTopic, cleanLocation, key, isNationalTarget));
       }
     });
 
-    const results = await Promise.all(tasks);
+    let results: any[];
+    if (keysToFetch.length > 1) {
+      const combined = await runCombinedFetch(cleanTopic, cleanLocation, isNationalTarget, keysToFetch);
+      results = keysToFetch.map(() => combined);
+    } else if (keysToFetch.length === 1) {
+      results = [await runSectionFetch(cleanTopic, cleanLocation, keysToFetch[0], isNationalTarget)];
+    } else {
+      results = [];
+    }
 
     setIsLoading(false);
     setIsRefreshing(false);
